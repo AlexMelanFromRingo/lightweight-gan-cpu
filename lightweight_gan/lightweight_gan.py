@@ -971,11 +971,13 @@ class LightweightGAN(nn.Module):
         self.use_compile = use_compile if use_compile is not None else should_use_compile()
         if self.use_compile:
             print("Applying torch.compile to models for better performance...")
-            # Compile models with mode='reduce-overhead' for training
-            self.G = torch.compile(self.G, mode='reduce-overhead')
-            self.D = torch.compile(self.D, mode='reduce-overhead')
-            self.GE = torch.compile(self.GE, mode='reduce-overhead')
-            print("torch.compile applied successfully!")
+            # Use 'default' mode to avoid CUDA graphs issues with GANs
+            # 'reduce-overhead' can cause issues with dynamic computation graphs
+            compile_mode = 'default'
+            self.G = torch.compile(self.G, mode=compile_mode)
+            self.D = torch.compile(self.D, mode=compile_mode)
+            self.GE = torch.compile(self.GE, mode=compile_mode)
+            print(f"torch.compile applied successfully (mode: {compile_mode})!")
 
     def _init_weights(self, m):
         if type(m) in {nn.Conv2d, nn.Linear}:
