@@ -1721,9 +1721,24 @@ class Trainer():
             raise e
 
         if 'G_scaler' in load_data:
-            self.G_scaler.load_state_dict(load_data['G_scaler'])
+            try:
+                self.G_scaler.load_state_dict(load_data['G_scaler'])
+            except RuntimeError as e:
+                # Handle loading from checkpoint with different AMP settings
+                # (e.g., checkpoint without AMP, loading with AMP enabled)
+                if "empty" in str(e).lower() or "disabled" in str(e).lower():
+                    print(f"Note: GradScaler state not loaded (checkpoint saved with different AMP setting)")
+                else:
+                    raise
         if 'D_scaler' in load_data:
-            self.D_scaler.load_state_dict(load_data['D_scaler'])
+            try:
+                self.D_scaler.load_state_dict(load_data['D_scaler'])
+            except RuntimeError as e:
+                # Handle loading from checkpoint with different AMP settings
+                if "empty" in str(e).lower() or "disabled" in str(e).lower():
+                    print(f"Note: GradScaler state not loaded (checkpoint saved with different AMP setting)")
+                else:
+                    raise
 
     def get_checkpoints(self):
         file_paths = [p for p in Path(self.models_dir / self.name).glob('model_*.pt')]
