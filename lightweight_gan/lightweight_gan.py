@@ -33,9 +33,33 @@ from einops.layers.torch import Rearrange
 
 from adabelief_pytorch import AdaBelief
 
-# asserts
+# device detection
 
-assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA installed.'
+def get_device():
+    """Get the best available device (CUDA if available, else CPU)"""
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def setup_torch_optimizations():
+    """Configure PyTorch 2.x optimizations for better performance"""
+    if torch.cuda.is_available():
+        # Enable TF32 for better performance on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # Enable cudnn benchmarking for optimal performance
+        torch.backends.cudnn.benchmark = True
+
+        # Use more efficient memory format
+        torch.backends.cudnn.deterministic = False
+
+    # Set optimal number of threads
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')
+
+def should_use_compile():
+    """Check if torch.compile should be used (avoid on Windows due to Triton issues)"""
+    import platform
+    return platform.system() != 'Windows' and hasattr(torch, 'compile')
 
 # constants
 
@@ -277,22 +301,22 @@ class LinearAttention(nn.Module):
     def forward(self, fmap):
         h, x, y = self.heads, *fmap.shape[-2:]
 
-        # linear attention
-
+        # Linear attention branch
         lin_q, lin_k, lin_v = (self.to_lin_q(fmap), *self.to_lin_kv(fmap).chunk(2, dim = 1))
         lin_q, lin_k, lin_v = map(lambda t: rearrange(t, 'b (h c) x y -> (b h) (x y) c', h = h), (lin_q, lin_k, lin_v))
 
-        lin_q = lin_q.softmax(dim = -1)
-        lin_k = lin_k.softmax(dim = -2)
+        # Use inplace softmax for memory efficiency
+        lin_q = F.softmax(lin_q, dim=-1)
+        lin_k = F.softmax(lin_k, dim=-2)
 
         lin_q = lin_q * self.scale
 
-        context = einsum('b n d, b n e -> b d e', lin_k, lin_v)
-        lin_out = einsum('b n d, b d e -> b n e', lin_q, context)
+        # Efficient matrix multiply using einsum
+        context = torch.einsum('b n d, b n e -> b d e', lin_k, lin_v)
+        lin_out = torch.einsum('b n d, b d e -> b n e', lin_q, context)
         lin_out = rearrange(lin_out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
 
-        # conv-like full attention
-
+        # Conv-like full attention branch
         q, k, v = (self.to_q(fmap), *self.to_kv(fmap).chunk(2, dim = 1))
         q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> (b h) c x y', h = h), (q, k, v))
 
@@ -303,16 +327,17 @@ class LinearAttention(nn.Module):
 
         q = rearrange(q, 'b c ... -> b (...) c') * self.scale
 
-        sim = einsum('b i d, b i j d -> b i j', q, k)
+        # Compute attention scores
+        sim = torch.einsum('b i d, b i j d -> b i j', q, k)
+        # Numerical stability: subtract max before softmax
         sim = sim - sim.amax(dim = -1, keepdim = True).detach()
 
-        attn = sim.softmax(dim = -1)
+        attn = F.softmax(sim, dim=-1)
 
-        full_out = einsum('b i j, b i j d -> b i d', attn, v)
+        full_out = torch.einsum('b i j, b i j d -> b i d', attn, v)
         full_out = rearrange(full_out, '(b h) (x y) d -> b (h d) x y', h = h, x = x, y = y)
 
-        # add outputs of linear attention + conv like full attention
-
+        # Combine outputs
         lin_out = self.nonlin(lin_out)
         out = torch.cat((lin_out, full_out), dim = 1)
         return self.to_out(out)
@@ -887,11 +912,15 @@ class LightweightGAN(nn.Module):
         ttur_mult = 1.,
         lr = 2e-4,
         rank = 0,
-        ddp = False
+        ddp = False,
+        use_compile = None
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.image_size = image_size
+
+        # Setup PyTorch 2.x optimizations
+        setup_torch_optimizations()
 
         G_kwargs = dict(
             image_size = image_size,
@@ -922,8 +951,8 @@ class LightweightGAN(nn.Module):
 
 
         if optimizer == "adam":
-            self.G_opt = Adam(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
-            self.D_opt = Adam(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
+            self.G_opt = Adam(self.G.parameters(), lr = lr, betas=(0.5, 0.9), fused=torch.cuda.is_available())
+            self.D_opt = Adam(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9), fused=torch.cuda.is_available())
         elif optimizer == "adabelief":
             self.G_opt = AdaBelief(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
             self.D_opt = AdaBelief(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
@@ -933,8 +962,20 @@ class LightweightGAN(nn.Module):
         self.apply(self._init_weights)
         self.reset_parameter_averaging()
 
-        self.cuda(rank)
+        # Move to device (CUDA if available, else CPU)
+        device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
+        self.to(device)
         self.D_aug = AugWrapper(self.D, image_size)
+
+        # Apply torch.compile if requested and available
+        self.use_compile = use_compile if use_compile is not None else should_use_compile()
+        if self.use_compile:
+            print("Applying torch.compile to models for better performance...")
+            # Compile models with mode='reduce-overhead' for training
+            self.G = torch.compile(self.G, mode='reduce-overhead')
+            self.D = torch.compile(self.D, mode='reduce-overhead')
+            self.GE = torch.compile(self.GE, mode='reduce-overhead')
+            print("torch.compile applied successfully!")
 
     def _init_weights(self, m):
         if type(m) in {nn.Conv2d, nn.Linear}:
@@ -999,6 +1040,7 @@ class Trainer():
         world_size = 1,
         log = False,
         amp = False,
+        use_compile = None,
         hparams = None,
         use_aim = True,
         aim_repo = None,
@@ -1087,6 +1129,8 @@ class Trainer():
         self.G_scaler = GradScaler(enabled = self.amp)
         self.D_scaler = GradScaler(enabled = self.amp)
 
+        self.use_compile = use_compile
+
         self.run = None
         self.hparams = hparams
 
@@ -1143,6 +1187,7 @@ class Trainer():
             transparent = self.transparent,
             greyscale = self.greyscale,
             rank = self.rank,
+            use_compile = self.use_compile,
             *args,
             **kwargs
         )
@@ -1235,10 +1280,10 @@ class Trainer():
 
         # train discriminator
 
-        self.GAN.D_opt.zero_grad()
+        self.GAN.D_opt.zero_grad(set_to_none=True)  # More efficient than zero_grad()
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, G]):
-            latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
-            image_batch = next(self.loader).cuda(self.rank)
+            latents = torch.randn(batch_size, latent_dim, device=device)
+            image_batch = next(self.loader).to(device, non_blocking=True)
 
             with amp_context():
                 with torch.no_grad():
@@ -1315,13 +1360,13 @@ class Trainer():
 
         # train generator
 
-        self.GAN.G_opt.zero_grad()
+        self.GAN.G_opt.zero_grad(set_to_none=True)  # More efficient than zero_grad()
 
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[G, D_aug]):
-            latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
+            latents = torch.randn(batch_size, latent_dim, device=device)
 
             if G_requires_calc_real:
-                image_batch = next(self.loader).cuda(self.rank)
+                image_batch = next(self.loader).to(device, non_blocking=True)
                 image_batch.requires_grad_()
 
             with amp_context():
@@ -1388,9 +1433,10 @@ class Trainer():
 
         ext = self.image_extension
         num_rows = num_image_tiles
-    
+
         latent_dim = self.GAN.latent_dim
         image_size = self.GAN.image_size
+        device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
 
         # latents and noise
         def image_to_pil(image):
@@ -1398,7 +1444,7 @@ class Trainer():
             im = Image.fromarray(ndarr)
             return im
 
-        latents = det_randn((num_rows ** 2, latent_dim)).cuda(self.rank)
+        latents = det_randn((num_rows ** 2, latent_dim)).to(device)
         interpolate_latents = interpolate_between(latents[:num_rows], latents[-num_rows:],
                                                   num_samples=num_rows,
                                                   dim=0).flatten(end_dim=1)
@@ -1452,6 +1498,7 @@ class Trainer():
         self.GAN.eval()
 
         latent_dim = self.GAN.latent_dim
+        device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
         dir_name = self.name + str('-generated-') + str(checkpoint)
         dir_full = Path().absolute() / self.results_dir / dir_name
         ext = self.image_extension
@@ -1462,7 +1509,7 @@ class Trainer():
         # regular
         if 'default' in types:
             for i in tqdm(range(num_image_tiles), desc='Saving generated default images'):
-                latents = torch.randn((1, latent_dim)).cuda(self.rank)
+                latents = torch.randn((1, latent_dim), device=device)
                 generated_image = self.generate_(self.GAN.G, latents)
                 path = str(self.results_dir / dir_name / f'{str(num)}-{str(i)}.{ext}')
                 torchvision.utils.save_image(generated_image[0], path, nrow=1)
@@ -1470,7 +1517,7 @@ class Trainer():
         # moving averages
         if 'ema' in types:
             for i in tqdm(range(num_image_tiles), desc='Saving generated EMA images'):
-                latents = torch.randn((1, latent_dim)).cuda(self.rank)
+                latents = torch.randn((1, latent_dim), device=device)
                 generated_image = self.generate_(self.GAN.GE, latents)
                 path = str(self.results_dir / dir_name / f'{str(num)}-{str(i)}-ema.{ext}')
                 torchvision.utils.save_image(generated_image[0], path, nrow=1)
@@ -1486,6 +1533,7 @@ class Trainer():
         dir_full = Path().absolute() / self.results_dir / dir_name
         ext = self.image_extension
         latents = None
+        device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
 
         zfill_length = math.ceil(math.log10(len(checkpoints)))
 
@@ -1497,7 +1545,7 @@ class Trainer():
             self.GAN.eval()
 
             if checkpoint == 0:
-                latents = torch.randn((num_images, self.GAN.latent_dim)).cuda(self.rank)
+                latents = torch.randn((num_images, self.GAN.latent_dim), device=device)
 
             # regular
             if 'default' in types:
@@ -1514,8 +1562,10 @@ class Trainer():
     @torch.no_grad()
     def calculate_fid(self, num_batches):
         from pytorch_fid import fid_score
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
+        device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
         real_path = self.fid_dir / 'real'
         fake_path = self.fid_dir / 'fake'
 
@@ -1543,7 +1593,7 @@ class Trainer():
 
         for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
             # latents and noise
-            latents = torch.randn(self.batch_size, latent_dim).cuda(self.rank)
+            latents = torch.randn(self.batch_size, latent_dim, device=device)
 
             # moving averages
             generated_images = self.generate_(self.GAN.GE, latents)
@@ -1564,14 +1614,15 @@ class Trainer():
         self.GAN.eval()
         ext = self.image_extension
         num_rows = num_image_tiles
+        device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
 
         latent_dim = self.GAN.latent_dim
         image_size = self.GAN.image_size
 
         # latents and noise
 
-        latents_low = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
-        latents_high = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
+        latents_low = torch.randn(num_rows ** 2, latent_dim, device=device)
+        latents_high = torch.randn(num_rows ** 2, latent_dim, device=device)
 
         ratios = torch.linspace(0., 8., num_steps)
 

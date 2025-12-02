@@ -115,6 +115,7 @@ def train_from_folder(
     clear_fid_cache = False,
     seed = 42,
     amp = False,
+    use_compile = None,
     show_progress = False,
     use_aim = False,
     aim_repo = None,
@@ -151,6 +152,7 @@ def train_from_folder(
         calculate_fid_num_images = calculate_fid_num_images,
         clear_fid_cache = clear_fid_cache,
         amp = amp,
+        use_compile = use_compile,
         load_strict = load_strict
     )
 
