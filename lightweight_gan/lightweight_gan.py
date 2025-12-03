@@ -1683,8 +1683,28 @@ class Trainer():
         self.init_folders()
 
     def save(self, num):
+        # Extract state dict from compiled models (removes _orig_mod prefix)
+        def get_state_dict(model):
+            if hasattr(model, '_orig_mod'):
+                # torch.compile wraps the model, get the original
+                return model._orig_mod.state_dict()
+            return model.state_dict()
+
+        # Save unwrapped state dicts for compatibility
+        gan_state = {}
+        for key in ['G', 'D', 'GE', 'G_opt', 'D_opt', 'ema_updater']:
+            if hasattr(self.GAN, key):
+                attr = getattr(self.GAN, key)
+                if hasattr(attr, 'state_dict'):
+                    if key in ['G', 'D', 'GE']:
+                        gan_state[key] = get_state_dict(attr)
+                    else:
+                        gan_state[key] = attr.state_dict()
+                else:
+                    gan_state[key] = attr
+
         save_data = {
-            'GAN': self.GAN.state_dict(),
+            'GAN': gan_state,
             'version': __version__,
             'G_scaler': self.G_scaler.state_dict(),
             'D_scaler': self.D_scaler.state_dict()
@@ -1714,10 +1734,64 @@ class Trainer():
             print(f"loading from version {load_data['version']}")
 
         try:
-            self.GAN.load_state_dict(load_data['GAN'], strict = self.load_strict)
+            # Handle both old format (full state_dict) and new format (dict of dicts)
+            gan_state = load_data['GAN']
+
+            # Check if it's the new format or old format
+            if isinstance(gan_state, dict) and 'G' in gan_state:
+                # New format - load each component separately
+                for key in ['G', 'D', 'GE']:
+                    if key in gan_state and hasattr(self.GAN, key):
+                        model = getattr(self.GAN, key)
+                        # Handle compiled models
+                        if hasattr(model, '_orig_mod'):
+                            model._orig_mod.load_state_dict(gan_state[key], strict=self.load_strict)
+                        else:
+                            model.load_state_dict(gan_state[key], strict=self.load_strict)
+
+                for key in ['G_opt', 'D_opt']:
+                    if key in gan_state and hasattr(self.GAN, key):
+                        getattr(self.GAN, key).load_state_dict(gan_state[key])
+            else:
+                # Old format - full state_dict with all components
+                # Need to extract and load each component separately to handle compiled models
+                state_dict = gan_state
+
+                # Helper function to extract state dict for a specific component
+                def extract_component_state(full_state, prefix):
+                    component_state = {}
+                    prefix_with_dot = prefix + '.'
+                    for k, v in full_state.items():
+                        if k.startswith(prefix_with_dot):
+                            # Remove component prefix and _orig_mod if present
+                            key = k[len(prefix_with_dot):]  # Remove "G." or "D." etc
+                            key = key.replace('_orig_mod.', '')  # Remove _orig_mod prefix
+                            component_state[key] = v
+                    return component_state
+
+                # Load each model component
+                for key in ['G', 'D', 'GE']:
+                    if hasattr(self.GAN, key):
+                        model = getattr(self.GAN, key)
+                        component_state = extract_component_state(state_dict, key)
+
+                        if len(component_state) > 0:
+                            # Load into _orig_mod if model is compiled, otherwise load normally
+                            if hasattr(model, '_orig_mod'):
+                                model._orig_mod.load_state_dict(component_state, strict=self.load_strict)
+                            else:
+                                model.load_state_dict(component_state, strict=self.load_strict)
+
+                # Load optimizers
+                for key in ['G_opt', 'D_opt']:
+                    if hasattr(self.GAN, key):
+                        opt = getattr(self.GAN, key)
+                        opt_state = extract_component_state(state_dict, key)
+                        if len(opt_state) > 0:
+                            opt.load_state_dict(opt_state)
         except Exception as e:
-            saved_version = load_data['version']
-            print('unable to load save model. please try downgrading the package to the version specified by the saved model (to do so, just run `pip install lightweight-gan=={saved_version}`')
+            saved_version = load_data.get('version', 'unknown')
+            print(f'unable to load save model. please try downgrading the package to the version specified by the saved model (to do so, just run `pip install lightweight-gan=={saved_version}`)')
             raise e
 
         if 'G_scaler' in load_data:

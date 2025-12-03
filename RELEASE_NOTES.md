@@ -1,3 +1,28 @@
+# Release Notes v1.2.2 - Checkpoint Compatibility Fix
+
+## 🐛 Critical Fix
+
+### Checkpoint Loading with torch.compile
+- **Fixed checkpoint incompatibility** when using torch.compile
+- Models compiled with torch.compile now save and load correctly
+- Full backward compatibility with old checkpoints (with `_orig_mod` prefix)
+- Can now resume training from any checkpoint regardless of compile state
+
+**Issue**: When `torch.compile` was enabled, saved checkpoints contained `_orig_mod.` prefixes in state dict keys, causing loading failures.
+
+**Solution**: Implemented smart save/load logic that:
+- Saves checkpoints without `_orig_mod` prefix (new format)
+- Loads old checkpoints (with prefix) correctly into compiled models
+- Maintains full backward compatibility
+
+## 📦 Installation
+
+```bash
+pip install dist/lightweight_gan-1.2.2-py3-none-any.whl
+```
+
+---
+
 # Release Notes v1.2.1 - CPU Support & PyTorch 2.x Optimizations
 
 ## 🎉 Major Features
